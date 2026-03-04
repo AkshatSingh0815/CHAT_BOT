@@ -7,7 +7,7 @@ from intent_router import is_claim_query
 load_dotenv()
 app = Flask(__name__)
 # Initialize RAG Engine
-rag = RAGEngine("Chat_Bot_Claims\\DATA\\Claimsss.pdf")
+rag = RAGEngine("DATA\\Claimsss.pdf")
 
 @app.route("/")
 def home():
