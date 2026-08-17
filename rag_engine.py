@@ -3,207 +3,182 @@ import time
 from collections import OrderedDict
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_groq import ChatGroq
-from langchain_classic.chains import RetrievalQA
+from langchain_classic.chains import RetrievalQA           #  fixed: langchain not langchain_classic
 from langchain_core.prompts import PromptTemplate
-from pydantic import SecretStr
+from langchain_core.documents import Document      #  fixed: langchain_core not langchain_classic
 from dotenv import load_dotenv
+from pydantic import SecretStr
+from ocr_pipeline import extract_all_image_text
+import os
+if "SSL_CERT_FILE" in os.environ:
+    del os.environ["SSL_CERT_FILE"]
 load_dotenv()
-
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+OCR_CACHE = os.path.join(BASE_DIR, "storage", "ocr_cache", "ocr_text.txt")
+VECTOR_DB = os.path.join(BASE_DIR, "storage", "vector_db")
 class RAGEngine:
     def __init__(self, pdf_path):
         self.pdf_path = pdf_path
-
-        # ---------------------------
-        # Build Vectorstore
-        # ---------------------------
         self.vectorstore = self.build_vectorstore()
-
-        # ---------------------------
-        # LLM (Groq)
-        # ---------------------------
         self.llm = ChatGroq(
             api_key=SecretStr(os.getenv("GROQ_API_KEY", "")),
             model="llama-3.3-70b-versatile",
             temperature=0
         )
-
-        # ---------------------------
-        # Retriever (MMR)
-        # ---------------------------
         self.retriever = self.vectorstore.as_retriever(
             search_type="mmr",
-            search_kwargs={"k": 5, "fetch_k": 10}
+            search_kwargs={"k": 5}
         )
-
-        # ---------------------------
-        # Custom PM-JAY Prompt (Chiti)
-        # ---------------------------
         self.prompt_template = PromptTemplate(
             input_variables=["context", "question"],
             template="""
-You are Chiti, an intelligent assistant helping users with claim-related queries.
-
-Your name is Chiti and you are a helpful assistant for PM-JAY claim-related questions developed by Akshat Singh.
-
+You are Chiti, a PM-JAY claims assistant.
+Use only the provided context.
+If answer not found say:
+"I'm sorry, I could not find relevant information."
 Rules:
+1.Answer me in HTML format with appropriate tags.
 1. Use ONLY the information provided in the CONTEXT section.
 2. Do NOT provide any information that is not present in the context.
 3. If the answer cannot be found in the context, reply:
-"I’m sorry, I could not find relevant information in the available records."
+   "I'm sorry, I could not find relevant information in the available records."
 4. Do NOT copy text verbatim from the context; always rephrase clearly and professionally.
 5. Remove duplicates and redundant information.
 6. Keep the response concise, clear, and well-structured.
 7. Understand minor spelling mistakes and grammatical errors.
 8. Detect the language of the user's question and respond ONLY in the SAME language.
-
 Formatting Rules:
 - Do NOT use bullet points.
 - Do NOT use markdown formatting.
 - Write short paragraphs.
 - Each paragraph must be separated by a blank line.
 - Each paragraph must contain 2-4 sentences only.
+use the exact formal below:
+<ol>
+    <ul>
+        <h3>heading</h3>
+        <li>point 1</li>
+        <li>point 2</li>
+    </ul> 
+</ol>
+continue the order of the points as per the context and do not change the order of the points.
 
-CONTEXT:
+Context:
 {context}
-
-User Question:
+Question:
 {question}
-
 Answer:
 """
+#--------------------------------------------------------------------------------------------------------------------------------
         )
-
-        # ---------------------------
-        # RetrievalQA Chain
-        # ---------------------------
         self.qa_chain = RetrievalQA.from_chain_type(
             llm=self.llm,
             retriever=self.retriever,
             return_source_documents=False,
-            chain_type_kwargs={
-                "prompt": self.prompt_template
-            }
+            chain_type_kwargs={"prompt": self.prompt_template}
         )
-
-        # ---------------------------
-        # LRU + TTL Cache
-        # ---------------------------
-        self.cache = OrderedDict()
+        self.cache: OrderedDict = OrderedDict()
         self.cache_limit = 100
-        self.cache_ttl = 60 * 60 * 3  # 3 hours
-
-        # ---------------------------
-        # Analytics
-        # ---------------------------
+        self.cache_ttl   = 60 * 60 * 3   # 3 hours
         self.total_queries = 0
-        self.cache_hits = 0
-
-    # ============================================================
-    # Build Vectorstore
-    # ============================================================
-
+        self.cache_hits    = 0
+    # ----------------------------------------------------------------------------------------------------------------------------
     def build_vectorstore(self):
-        loader = PyPDFLoader(self.pdf_path)
-        documents = loader.load()
-
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200
-        )
-
-        chunks = splitter.split_documents(documents)
+        print("Building vector store...")
+        os.makedirs(os.path.dirname(OCR_CACHE), exist_ok=True)
+        os.makedirs(VECTOR_DB, exist_ok=True)
 
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
+        if os.path.exists(os.path.join(VECTOR_DB, "index.faiss")):
+            print("Loading existing vector store from disk...")
+            return FAISS.load_local(
+                VECTOR_DB, embeddings, allow_dangerous_deserialization=True
+            )
+        #----------------------------------------------------------------------------------------------------------------------------
+        # --- PDF text chunks ---
+        print("Loading and splitting PDF...")
+        loader   = PyPDFLoader(self.pdf_path)
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=200
+        )
+        chunks = loader.load_and_split(text_splitter=splitter)
+        print(f"PDF chunks: {len(chunks)}")
+        # --- OCR text ---
+        if os.path.exists(OCR_CACHE):
+            with open(OCR_CACHE, "r", encoding="utf-8") as f:
+                ocr_text = f.read()
+            print("OCR text loaded from cache.")
+        else:
+            print("Running OCR pipeline (this may take a while)...")
+            ocr_text = extract_all_image_text(self.pdf_path)
+            with open(OCR_CACHE, "w", encoding="utf-8") as f:
+                f.write(ocr_text)
+            print("OCR text extracted and cached successfully.")
 
+        if ocr_text.strip():
+            print("Splitting OCR text...")
+            ocr_doc    = Document(page_content=ocr_text, metadata={"source": "ocr"})
+            ocr_chunks = splitter.split_documents([ocr_doc])
+            chunks.extend(ocr_chunks)
+            print(f"OCR chunks added: {len(ocr_chunks)}")
+
+        print(f"Total chunks: {len(chunks)}")
+
+        print("Generating embeddings and saving vector store...")
         vectorstore = FAISS.from_documents(chunks, embeddings)
+        vectorstore.save_local(VECTOR_DB)
+        print("Vector store built and saved successfully.")
         return vectorstore
 
-    # ============================================================
-    # Cache Maintenance
-    # ============================================================
+    # ------------------------------------------------------------------
+    def _is_cache_valid(self, entry: dict) -> bool:
+        """Return True if the cache entry has not expired."""
+        return (time.time() - entry["timestamp"]) < self.cache_ttl
 
-    def clean_expired_cache(self):
-        current_time = time.time()
-        expired_keys = []
-
-        for key, value in self.cache.items():
-            if current_time - value["timestamp"] > self.cache_ttl:
-                expired_keys.append(key)
-
-        for key in expired_keys:
-            del self.cache[key]
-
-    def enforce_lru_limit(self):
-        while len(self.cache) > self.cache_limit:
-            self.cache.popitem(last=False)
-
-    # ============================================================
-    # Answer Formatter (Extra Safety Layer)
-    # ============================================================
-
-    def format_answer(self, text):
-        text = text.replace("•", "")
-        text = text.replace("* ", "")
-        text = text.replace("- ", "")
-
-        paragraphs = text.split("\n")
-        clean_paragraphs = []
-
-        for p in paragraphs:
-            p = p.strip()
-            if p:
-                clean_paragraphs.append(p)
-
-        return "\n\n".join(clean_paragraphs)
-
-    # ============================================================
-    # Main Answer Function
-    # ============================================================
-
-    def answer(self, query):
+    # ------------------------------------------------------------------
+    def answer(self, query: str) -> str:
         self.total_queries += 1
 
-        # Clean expired cache
-        self.clean_expired_cache()
-
-        # Cache Check (Exact Match)
+        # Check cache (with TTL enforcement)
         if query in self.cache:
-            self.cache_hits += 1
-            self.cache.move_to_end(query)
-            return self.cache[query]["response"]
+            entry = self.cache[query]
+            if self._is_cache_valid(entry):
+                self.cache_hits += 1
+                # Move to end to keep it 'recently used'
+                self.cache.move_to_end(query)
+                return entry["response"]
+            else:
+                # Expired — remove it
+                del self.cache[query]
 
-        # Generate Response via RAG
+        # Query the LLM
         response = self.qa_chain.invoke({"query": query})
-        answer = response["result"]
+        answer   = response["result"]
 
-        formatted_answer = self.format_answer(answer)
+        # Evict oldest entry if over limit
+        if len(self.cache) >= self.cache_limit:
+            self.cache.popitem(last=False)
 
-        # Store in Cache
         self.cache[query] = {
-            "response": formatted_answer,
+            "response":  answer,
             "timestamp": time.time()
         }
 
-        self.enforce_lru_limit()
+        return answer
 
-        return formatted_answer
-
-    # ============================================================
-    # Analytics
-    # ============================================================
-
-    def get_analytics(self):
+    # ------------------------------------------------------------------
+    def get_analytics(self) -> dict:
         return {
             "total_queries": self.total_queries,
-            "cache_hits": self.cache_hits,
+            "cache_hits":    self.cache_hits,
             "cache_hit_rate": (
-                round((self.cache_hits / self.total_queries) * 100, 2)
-                if self.total_queries > 0 else 0
-            ),
-            "current_cache_size": len(self.cache)
+                f"{(self.cache_hits / self.total_queries * 100):.1f}%"
+                if self.total_queries > 0 else "N/A"
+            )
         }

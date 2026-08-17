@@ -1,3 +1,13 @@
-.env
+# Ignore data and PDFs
+
+# Ignore third-party binaries and dependencies
+poppler-*/
+*.dll
+*.exe
+*.so
+*.dylib
+
+# Ignore Python cache
+__pycache__/
 *.pyc
-*.pem
+.ipynb_checkpoints/
